@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,7 +17,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-co-op/gocron"
 	"github.com/gosnmp/gosnmp"
+	mackerel "github.com/mackerelio/mackerel-client-go"
 )
 
 const (
@@ -54,6 +57,13 @@ var deltaValues = map[string]bool{
 	"ifHCOutOctets": true,
 }
 
+var receiveDirection = map[string]bool{
+	"ifInOctets":   true,
+	"ifHCInOctets": true,
+	"ifInDiscards": true,
+	"ifInErrors":   true,
+}
+
 type ResultWithName struct {
 	name  string
 	value map[uint64]uint64
@@ -65,6 +75,68 @@ type SnapshotDutum struct {
 	value   uint64
 }
 
+type MetricsDutum struct {
+	name   string
+	ifName string
+	value  uint64
+	delta  bool
+}
+
+var graphDefs = []*mackerel.GraphDefsParam{
+	&mackerel.GraphDefsParam{
+		Name:        "custom.interface.ifInDiscards",
+		Unit:        "integer",
+		DisplayName: "In Discards",
+		Metrics: []*mackerel.GraphDefsMetric{
+			&mackerel.GraphDefsMetric{
+				Name:        "custom.interface.ifInDiscards.*",
+				DisplayName: "%1",
+			},
+		},
+	},
+	&mackerel.GraphDefsParam{
+		Name:        "custom.interface.ifOutDiscards",
+		Unit:        "integer",
+		DisplayName: "Out Discards",
+		Metrics: []*mackerel.GraphDefsMetric{
+			&mackerel.GraphDefsMetric{
+				Name:        "custom.interface.ifOutDiscards.*",
+				DisplayName: "%1",
+			},
+		},
+	},
+	&mackerel.GraphDefsParam{
+		Name:        "custom.interface.ifInErrors",
+		Unit:        "integer",
+		DisplayName: "In Errors",
+		Metrics: []*mackerel.GraphDefsMetric{
+			&mackerel.GraphDefsMetric{
+				Name:        "custom.interface.ifInErrors.*",
+				DisplayName: "%1",
+			},
+		},
+	},
+	&mackerel.GraphDefsParam{
+		Name:        "custom.interface.ifOutErrors",
+		Unit:        "integer",
+		DisplayName: "Out Errors",
+		Metrics: []*mackerel.GraphDefsMetric{
+			&mackerel.GraphDefsMetric{
+				Name:        "custom.interface.ifOutErrors.*",
+				DisplayName: "%1",
+			},
+		},
+	},
+}
+
+type CollectParams struct {
+	community, target, snapshotPath    string
+	mibs                               []string
+	includeRegexp, excludeRegexp       *regexp.Regexp
+	includeInterface, excludeInterface *string
+	verbose                            *bool
+}
+
 func main() {
 	var community, target string
 	flag.StringVar(&community, "community", "public", "the community string for device")
@@ -72,6 +144,7 @@ func main() {
 	includeInterface := flag.String("include-interface", "", "include interface name")
 	excludeInterface := flag.String("exclude-interface", "", "exclude interface name")
 	rawMibs := flag.String("mibs", "all", "mib name joind with ',' or 'all'")
+	verbose := flag.Bool("verbose", false, "verbose")
 	flag.Parse()
 
 	// TODO rule.
@@ -97,54 +170,94 @@ func main() {
 		log.Fatal(err)
 	}
 
-	gosnmp.Default.Target = target
-	gosnmp.Default.Community = community
-	gosnmp.Default.Timeout = time.Duration(10 * time.Second)
-	err = gosnmp.Default.Connect()
+	err = initialForMackerel(target)
 	if err != nil {
-		log.Fatal("Connect err: %v", err)
+		log.Fatal(err)
+	}
+	if *verbose {
+		log.Println("init for mackerel")
+	}
+
+	rand.Seed(time.Now().UnixNano())
+
+	s := gocron.NewScheduler(time.UTC)
+
+	_, err = s.Every(1).Minutes().Do(func() {
+		err = collect(&CollectParams{
+			target:           target,
+			community:        community,
+			mibs:             mibs,
+			snapshotPath:     ssPath,
+			includeRegexp:    includeReg,
+			excludeRegexp:    excludeReg,
+			includeInterface: includeInterface,
+			excludeInterface: excludeInterface,
+			verbose:          verbose,
+		})
+		if err != nil {
+			log.Println(err)
+		}
+	})
+	if err != nil {
+		log.Println(err)
+	}
+
+	log.Println("start")
+	s.RunAllWithDelay(time.Duration(rand.Intn(10)) * time.Second)
+
+	s.StartBlocking()
+}
+
+func collect(c *CollectParams) error {
+	gosnmp.Default.Target = c.target
+	gosnmp.Default.Community = c.community
+	gosnmp.Default.Timeout = time.Duration(10 * time.Second)
+	err := gosnmp.Default.Connect()
+	if err != nil {
+		return err
 	}
 	defer gosnmp.Default.Conn.Close()
 
 	ifNumber, err := getInterfaceNumber()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	ifDescr, err := bulkWalkGetInterfaceName(ifNumber)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	ifIndex, err := bulkWalkGetInterfaceNumber(ifNumber)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
-	results := make([]ResultWithName, 0, len(mibs))
-	for _, mib := range mibs {
+	results := make([]ResultWithName, 0, len(c.mibs))
+	for _, mib := range c.mibs {
 		result, err := bulkWalk(mibOidmapping[mib], ifNumber)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		results = append(results, ResultWithName{name: mib, value: result})
 	}
 
 	var snapshotData []SnapshotDutum
-	if _, err := os.Stat(ssPath); err == nil {
-		snapshotData, err = loadSnapshot(ssPath)
+	if _, err := os.Stat(c.snapshotPath); err == nil {
+		snapshotData, err = loadSnapshot(c.snapshotPath)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 	}
 
 	savedSnapshot := make([]SnapshotDutum, 0)
 
+	metrics := make([]MetricsDutum, 0, len(results))
 	for _, ifNum := range ifIndex {
 		ifName := ifDescr[ifNum]
-		if *includeInterface != "" && !includeReg.MatchString(ifName) {
+		if *c.includeInterface != "" && !c.includeRegexp.MatchString(ifName) {
 			continue
 		}
 
-		if *excludeInterface != "" && excludeReg.MatchString(ifName) {
+		if *c.excludeInterface != "" && c.excludeRegexp.MatchString(ifName) {
 			continue
 		}
 
@@ -162,17 +275,144 @@ func main() {
 				}
 			}
 			value = calcurateDiff(prevValue, value, overflowValue[key])
-			log.Printf("%s\t%s\t%d\n", escapeInterfaceName(ifName), key, value)
+			metrics = append(metrics, MetricsDutum{name: key, ifName: ifName, value: value, delta: deltaValues[key]})
+
+			if *c.verbose {
+				log.Printf("%s\t%s\t%d\n", escapeInterfaceName(ifName), key, value)
+			}
 		}
 	}
-	err = saveSnapshot(ssPath, savedSnapshot)
+	err = saveSnapshot(c.snapshotPath, savedSnapshot)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
+	err = sendToMackerel(c.target, metrics)
+	if err != nil {
+		return err
+	} else {
+		if *c.verbose {
+			log.Println("send mackerel")
+		}
+	}
+	return nil
 }
 
 func escapeInterfaceName(ifName string) string {
 	return strings.Replace(ifName, ".", "_", -1)
+}
+
+func initialForMackerel(target string) error {
+	api := os.Getenv("MACKEREL_API_KEY")
+	if api == "" {
+		log.Println("skip mackerel")
+		return nil
+	}
+	client := mackerel.NewClient(api)
+
+	idPath, err := hostIdPath(target)
+	if err != nil {
+		return err
+	}
+	mkInterfaces := []mackerel.Interface{
+		mackerel.Interface{
+			Name:          "main",
+			IPv4Addresses: []string{target},
+		},
+	}
+	var hostId string
+	if _, err := os.Stat(idPath); err == nil {
+		bytes, err := os.ReadFile(idPath)
+		if err != nil {
+			return err
+		}
+		hostId = string(bytes)
+		_, err = client.UpdateHost(hostId, &mackerel.UpdateHostParam{
+			Name:       target,
+			Interfaces: mkInterfaces,
+		})
+		if err != nil {
+			return err
+		}
+	} else {
+		hostId, err = client.CreateHost(&mackerel.CreateHostParam{
+			Name:       target,
+			Interfaces: mkInterfaces,
+		})
+		if err != nil {
+			return err
+		}
+		err = os.WriteFile(idPath, []byte(hostId), 0666)
+		if err != nil {
+			return err
+		}
+	}
+	err = client.CreateGraphDefs(graphDefs)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func sendToMackerel(target string, metrics []MetricsDutum) error {
+	now := time.Now().Unix()
+	api := os.Getenv("MACKEREL_API_KEY")
+	if api == "" {
+		log.Println("skip mackerel")
+		return nil
+	}
+	client := mackerel.NewClient(api)
+
+	idPath, err := hostIdPath(target)
+	if err != nil {
+		return err
+	}
+	bytes, err := os.ReadFile(idPath)
+	if err != nil {
+		return err
+	}
+	hostId := string(bytes)
+
+	mkMetrics := make([]*mackerel.HostMetricValue, 0, len(metrics))
+	for _, metric := range metrics {
+		if metric.delta {
+			direction := "txBytes"
+			if receiveDirection[metric.name] {
+				direction = "rxBytes"
+			}
+			mkName := fmt.Sprintf("interface.%s.%s.delta", escapeInterfaceName(metric.ifName), direction)
+			mkMetrics = append(mkMetrics, &mackerel.HostMetricValue{
+				HostID: hostId,
+				MetricValue: &mackerel.MetricValue{
+					Name:  mkName,
+					Time:  now,
+					Value: (metric.value / 60),
+				},
+			})
+		} else {
+			mkName := fmt.Sprintf("custom.interface.%s.%s", metric.name, escapeInterfaceName(metric.ifName))
+			mkMetrics = append(mkMetrics, &mackerel.HostMetricValue{
+				HostID: hostId,
+				MetricValue: &mackerel.MetricValue{
+					Name:  mkName,
+					Time:  now,
+					Value: metric.value,
+				},
+			})
+		}
+	}
+	err = client.PostHostMetricValues(mkMetrics)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func hostIdPath(target string) (string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(wd, fmt.Sprintf("%s.id.txt", target)), nil
 }
 
 func snapshotPath(target string) (string, error) {
