@@ -165,7 +165,10 @@ func main() {
 			log.Printf("%s\t%s\t%d\n", escapeInterfaceName(ifName), key, value)
 		}
 	}
-	saveSnapshot(ssPath, savedSnapshot)
+	err = saveSnapshot(ssPath, savedSnapshot)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
 func escapeInterfaceName(ifName string) string {
@@ -194,7 +197,10 @@ func saveSnapshot(ssPath string, snapshot []SnapshotDutum) error {
 		records = append(records, []string{strconv.FormatUint(v.ifIndex, 10), v.key, strconv.FormatUint(v.value, 10)})
 	}
 
-	writer.WriteAll(records)
+	err = writer.WriteAll(records)
+	if err != nil {
+		return err
+	}
 
 	if err := writer.Error(); err != nil {
 		return err
@@ -247,7 +253,7 @@ func mibsValidate(rawMibs *string) ([]string, error) {
 	default:
 		for _, name := range strings.Split(*rawMibs, ",") {
 			if _, exists := mibOidmapping[name]; !exists {
-				return nil, errors.New(fmt.Sprintf("mib %s is not supported.", name))
+				return nil, fmt.Errorf("mib %s is not supported.", name)
 			}
 			parseMibs = append(parseMibs, name)
 		}
@@ -284,7 +290,7 @@ func getInterfaceNumber() (uint64, error) {
 
 func bulkWalkGetInterfaceNumber(length uint64) ([]uint64, error) {
 	kv := make([]uint64, 0, length)
-	gosnmp.Default.BulkWalk(MIBifIndex, func(pdu gosnmp.SnmpPDU) error {
+	err := gosnmp.Default.BulkWalk(MIBifIndex, func(pdu gosnmp.SnmpPDU) error {
 		switch pdu.Type {
 		case gosnmp.OctetString:
 			return errors.New("cant parse interface number.")
@@ -293,6 +299,9 @@ func bulkWalkGetInterfaceNumber(length uint64) ([]uint64, error) {
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 	sort.Slice(kv, func(i, j int) bool {
 		return kv[i] < kv[j]
 	})
@@ -301,7 +310,7 @@ func bulkWalkGetInterfaceNumber(length uint64) ([]uint64, error) {
 
 func bulkWalkGetInterfaceName(length uint64) (map[uint64]string, error) {
 	kv := make(map[uint64]string, length)
-	gosnmp.Default.BulkWalk(MIBifDescr, func(pdu gosnmp.SnmpPDU) error {
+	err := gosnmp.Default.BulkWalk(MIBifDescr, func(pdu gosnmp.SnmpPDU) error {
 		index, err := captureIfIndex(MIBifDescr, pdu.Name)
 		if err != nil {
 			return err
@@ -314,12 +323,15 @@ func bulkWalkGetInterfaceName(length uint64) (map[uint64]string, error) {
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 	return kv, nil
 }
 
 func bulkWalk(oid string, length uint64) (map[uint64]uint64, error) {
 	kv := make(map[uint64]uint64, length)
-	gosnmp.Default.BulkWalk(oid, func(pdu gosnmp.SnmpPDU) error {
+	err := gosnmp.Default.BulkWalk(oid, func(pdu gosnmp.SnmpPDU) error {
 		index, err := captureIfIndex(oid, pdu.Name)
 		if err != nil {
 			return err
@@ -332,5 +344,8 @@ func bulkWalk(oid string, length uint64) (map[uint64]uint64, error) {
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 	return kv, nil
 }
