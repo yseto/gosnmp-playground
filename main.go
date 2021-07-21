@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"errors"
 	"flag"
@@ -8,8 +9,8 @@ import (
 	"io"
 	"log"
 	"math"
-	"math/rand"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -17,7 +18,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-co-op/gocron"
 	"github.com/gosnmp/gosnmp"
 	mackerel "github.com/mackerelio/mackerel-client-go"
 )
@@ -137,7 +137,7 @@ type CollectParams struct {
 	verbose                            *bool
 }
 
-func main() {
+func parseFlags() (*CollectParams, error) {
 	var community, target string
 	flag.StringVar(&community, "community", "public", "the community string for device")
 	flag.StringVar(&target, "target", "127.0.0.1", "ip address")
@@ -149,93 +149,127 @@ func main() {
 
 	// TODO rule.
 	if *includeInterface != "" && *excludeInterface != "" {
-		log.Fatal("excludeInterface, includeInterface is exclusive control.")
+		return nil, errors.New("excludeInterface, includeInterface is exclusive control.")
 	}
 	includeReg, err := regexp.Compile(*includeInterface)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	excludeReg, err := regexp.Compile(*excludeInterface)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
 	mibs, err := mibsValidate(rawMibs)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
 	ssPath, err := snapshotPath(target)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
-	err = initialForMackerel(target)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if *verbose {
-		log.Println("init for mackerel")
-	}
-
-	rand.Seed(time.Now().UnixNano())
-
-	s := gocron.NewScheduler(time.UTC)
-
-	_, err = s.Every(1).Minutes().Do(func() {
-		err = collect(&CollectParams{
-			target:           target,
-			community:        community,
-			mibs:             mibs,
-			snapshotPath:     ssPath,
-			includeRegexp:    includeReg,
-			excludeRegexp:    excludeReg,
-			includeInterface: includeInterface,
-			excludeInterface: excludeInterface,
-			verbose:          verbose,
-		})
-		if err != nil {
-			log.Println(err)
-		}
-	})
-	if err != nil {
-		log.Println(err)
-	}
-
-	log.Println("start")
-	s.RunAllWithDelay(time.Duration(rand.Intn(10)) * time.Second)
-
-	s.StartBlocking()
+	return &CollectParams{
+		target:           target,
+		community:        community,
+		mibs:             mibs,
+		snapshotPath:     ssPath,
+		includeRegexp:    includeReg,
+		excludeRegexp:    excludeReg,
+		includeInterface: includeInterface,
+		excludeInterface: excludeInterface,
+		verbose:          verbose,
+	}, nil
 }
 
-func collect(c *CollectParams) error {
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	collectParams, err := parseFlags()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	hostId, err := initialForMackerel(collectParams.target)
+	if err != nil {
+		log.Fatal(err)
+	} else {
+		if *collectParams.verbose {
+			log.Println("init for mackerel")
+		}
+	}
+	log.Println("start")
+	ticker(ctx, hostId, collectParams)
+}
+
+func ticker(ctx context.Context, hostId *string, c *CollectParams) {
+	t := time.NewTicker(1 * time.Minute)
+	defer func() {
+		fmt.Println("stopping...")
+		t.Stop()
+	}()
+
+	api := os.Getenv("MACKEREL_API_KEY")
+	client := mackerel.NewClient(api)
+
+	for {
+		select {
+		case <-t.C:
+			metrics, err := collect(ctx, c)
+			if err != nil {
+				log.Println(err)
+			}
+
+			if hostId != nil && api != "" {
+				mkMetrics := transform(hostId, metrics)
+				err = client.PostHostMetricValues(mkMetrics)
+				if err != nil {
+					log.Println(err)
+				} else {
+					if *c.verbose {
+						log.Println("send mackerel")
+					}
+				}
+			}
+
+		case <-ctx.Done():
+			log.Println("cancellation from context:", ctx.Err())
+			return
+		}
+	}
+}
+
+func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
 	gosnmp.Default.Target = c.target
 	gosnmp.Default.Community = c.community
 	gosnmp.Default.Timeout = time.Duration(10 * time.Second)
+	gosnmp.Default.Context = ctx
 	err := gosnmp.Default.Connect()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer gosnmp.Default.Conn.Close()
 
 	ifNumber, err := getInterfaceNumber()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ifDescr, err := bulkWalkGetInterfaceName(ifNumber)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ifIndex, err := bulkWalkGetInterfaceNumber(ifNumber)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	results := make([]ResultWithName, 0, len(c.mibs))
 	for _, mib := range c.mibs {
 		result, err := bulkWalk(mibOidmapping[mib], ifNumber)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		results = append(results, ResultWithName{name: mib, value: result})
 	}
@@ -244,7 +278,7 @@ func collect(c *CollectParams) error {
 	if _, err := os.Stat(c.snapshotPath); err == nil {
 		snapshotData, err = loadSnapshot(c.snapshotPath)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -284,34 +318,26 @@ func collect(c *CollectParams) error {
 	}
 	err = saveSnapshot(c.snapshotPath, savedSnapshot)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	err = sendToMackerel(c.target, metrics)
-	if err != nil {
-		return err
-	} else {
-		if *c.verbose {
-			log.Println("send mackerel")
-		}
-	}
-	return nil
+	return metrics, nil
 }
 
 func escapeInterfaceName(ifName string) string {
 	return strings.Replace(ifName, ".", "_", -1)
 }
 
-func initialForMackerel(target string) error {
+func initialForMackerel(target string) (*string, error) {
 	api := os.Getenv("MACKEREL_API_KEY")
 	if api == "" {
 		log.Println("skip mackerel")
-		return nil
+		return nil, nil
 	}
 	client := mackerel.NewClient(api)
 
 	idPath, err := hostIdPath(target)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	mkInterfaces := []mackerel.Interface{
 		mackerel.Interface{
@@ -323,7 +349,7 @@ func initialForMackerel(target string) error {
 	if _, err := os.Stat(idPath); err == nil {
 		bytes, err := os.ReadFile(idPath)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		hostId = string(bytes)
 		_, err = client.UpdateHost(hostId, &mackerel.UpdateHostParam{
@@ -331,7 +357,7 @@ func initialForMackerel(target string) error {
 			Interfaces: mkInterfaces,
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 	} else {
 		hostId, err = client.CreateHost(&mackerel.CreateHostParam{
@@ -339,38 +365,22 @@ func initialForMackerel(target string) error {
 			Interfaces: mkInterfaces,
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 		err = os.WriteFile(idPath, []byte(hostId), 0666)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	err = client.CreateGraphDefs(graphDefs)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return &hostId, nil
 }
 
-func sendToMackerel(target string, metrics []MetricsDutum) error {
+func transform(hostId *string, metrics []MetricsDutum) []*mackerel.HostMetricValue {
 	now := time.Now().Unix()
-	api := os.Getenv("MACKEREL_API_KEY")
-	if api == "" {
-		log.Println("skip mackerel")
-		return nil
-	}
-	client := mackerel.NewClient(api)
-
-	idPath, err := hostIdPath(target)
-	if err != nil {
-		return err
-	}
-	bytes, err := os.ReadFile(idPath)
-	if err != nil {
-		return err
-	}
-	hostId := string(bytes)
 
 	mkMetrics := make([]*mackerel.HostMetricValue, 0, len(metrics))
 	for _, metric := range metrics {
@@ -381,7 +391,7 @@ func sendToMackerel(target string, metrics []MetricsDutum) error {
 			}
 			mkName := fmt.Sprintf("interface.%s.%s.delta", escapeInterfaceName(metric.ifName), direction)
 			mkMetrics = append(mkMetrics, &mackerel.HostMetricValue{
-				HostID: hostId,
+				HostID: *hostId,
 				MetricValue: &mackerel.MetricValue{
 					Name:  mkName,
 					Time:  now,
@@ -391,7 +401,7 @@ func sendToMackerel(target string, metrics []MetricsDutum) error {
 		} else {
 			mkName := fmt.Sprintf("custom.interface.%s.%s", metric.name, escapeInterfaceName(metric.ifName))
 			mkMetrics = append(mkMetrics, &mackerel.HostMetricValue{
-				HostID: hostId,
+				HostID: *hostId,
 				MetricValue: &mackerel.MetricValue{
 					Name:  mkName,
 					Time:  now,
@@ -400,11 +410,7 @@ func sendToMackerel(target string, metrics []MetricsDutum) error {
 			})
 		}
 	}
-	err = client.PostHostMetricValues(mkMetrics)
-	if err != nil {
-		return err
-	}
-	return nil
+	return mkMetrics
 }
 
 func hostIdPath(target string) (string, error) {
