@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"context"
 	"encoding/csv"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gosnmp/gosnmp"
@@ -137,6 +139,10 @@ type CollectParams struct {
 	verbose                            *bool
 }
 
+var buffers = list.New()
+var mutex = &sync.Mutex{}
+var apikey = os.Getenv("MACKEREL_API_KEY")
+
 func parseFlags() (*CollectParams, error) {
 	var community, target string
 	flag.StringVar(&community, "community", "public", "the community string for device")
@@ -147,7 +153,6 @@ func parseFlags() (*CollectParams, error) {
 	verbose := flag.Bool("verbose", false, "verbose")
 	flag.Parse()
 
-	// TODO rule.
 	if *includeInterface != "" && *excludeInterface != "" {
 		return nil, errors.New("excludeInterface, includeInterface is exclusive control.")
 	}
@@ -192,27 +197,37 @@ func main() {
 		log.Fatal(err)
 	}
 
-	hostId, err := initialForMackerel(collectParams.target)
-	if err != nil {
-		log.Fatal(err)
-	} else {
-		if *collectParams.verbose {
-			log.Println("init for mackerel")
-		}
-	}
 	log.Println("start")
-	ticker(ctx, hostId, collectParams)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go ticker(ctx, &wg, collectParams)
+
+	if apikey == "" {
+		log.Println("skip mackerel")
+	} else {
+		wg.Add(1)
+		go sendTicker(ctx, &wg, *collectParams.verbose)
+	}
+	wg.Wait()
 }
 
-func ticker(ctx context.Context, hostId *string, c *CollectParams) {
+func ticker(ctx context.Context, wg *sync.WaitGroup, c *CollectParams) {
 	t := time.NewTicker(1 * time.Minute)
 	defer func() {
 		fmt.Println("stopping...")
 		t.Stop()
+		wg.Done()
 	}()
 
-	api := os.Getenv("MACKEREL_API_KEY")
-	client := mackerel.NewClient(api)
+	var hostId *string
+	if apikey != "" {
+		var err error
+		hostId, err = initialForMackerel(c.target, *c.verbose)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 
 	for {
 		select {
@@ -222,16 +237,11 @@ func ticker(ctx context.Context, hostId *string, c *CollectParams) {
 				log.Println(err)
 			}
 
-			if hostId != nil && api != "" {
+			if apikey != "" {
 				mkMetrics := transform(hostId, metrics)
-				err = client.PostHostMetricValues(mkMetrics)
-				if err != nil {
-					log.Println(err)
-				} else {
-					if *c.verbose {
-						log.Println("send mackerel")
-					}
-				}
+				mutex.Lock()
+				buffers.PushBack(mkMetrics)
+				mutex.Unlock()
 			}
 
 		case <-ctx.Done():
@@ -239,6 +249,51 @@ func ticker(ctx context.Context, hostId *string, c *CollectParams) {
 			return
 		}
 	}
+}
+
+func sendTicker(ctx context.Context, wg *sync.WaitGroup, verbose bool) {
+	t := time.NewTicker(500 * time.Millisecond)
+	client := mackerel.NewClient(apikey)
+
+	defer func() {
+		log.Println("stopping...")
+		t.Stop()
+		wg.Done()
+	}()
+
+	for {
+		select {
+		case <-t.C:
+			send(ctx, client, verbose)
+
+		case <-ctx.Done():
+			log.Println("cancellation from context:", ctx.Err())
+			return
+		}
+	}
+}
+
+func send(ctx context.Context, client *mackerel.Client, verbose bool) {
+	if buffers.Len() == 0 {
+		return
+	}
+
+	e := buffers.Front()
+	// log.Printf("send current value: %#v\n", e.Value)
+	// log.Printf("buffers len: %d\n", buffers.Len())
+
+	err := client.PostHostMetricValues(e.Value.([]*mackerel.HostMetricValue))
+	if err != nil {
+		log.Println(err)
+		return
+	} else {
+		if verbose {
+			log.Println("send mackerel")
+		}
+	}
+	mutex.Lock()
+	buffers.Remove(e)
+	mutex.Unlock()
 }
 
 func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
@@ -327,13 +382,12 @@ func escapeInterfaceName(ifName string) string {
 	return strings.Replace(ifName, ".", "_", -1)
 }
 
-func initialForMackerel(target string) (*string, error) {
-	api := os.Getenv("MACKEREL_API_KEY")
-	if api == "" {
-		log.Println("skip mackerel")
-		return nil, nil
+func initialForMackerel(target string, verbose bool) (*string, error) {
+	client := mackerel.NewClient(apikey)
+
+	if verbose {
+		log.Println("init for mackerel")
 	}
-	client := mackerel.NewClient(api)
 
 	idPath, err := hostIdPath(target)
 	if err != nil {
