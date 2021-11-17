@@ -42,14 +42,14 @@ var mibOidmapping = map[string]string{
 }
 
 var overflowValue = map[string]uint64{
-	"ifInOctets":    math.MaxInt32,
-	"ifOutOctets":   math.MaxInt32,
-	"ifHCInOctets":  math.MaxInt64,
-	"ifHCOutOctets": math.MaxInt64,
-	"ifInDiscards":  math.MaxInt64,
-	"ifOutDiscards": math.MaxInt64,
-	"ifInErrors":    math.MaxInt64,
-	"ifOutErrors":   math.MaxInt64,
+	"ifInOctets":    math.MaxUint32,
+	"ifOutOctets":   math.MaxUint32,
+	"ifHCInOctets":  math.MaxUint64,
+	"ifHCOutOctets": math.MaxUint64,
+	"ifInDiscards":  math.MaxUint64,
+	"ifOutDiscards": math.MaxUint64,
+	"ifInErrors":    math.MaxUint64,
+	"ifOutErrors":   math.MaxUint64,
 }
 
 var deltaValues = map[string]bool{
