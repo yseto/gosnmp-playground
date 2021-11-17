@@ -25,9 +25,10 @@ import (
 )
 
 const (
-	MIBifNumber = "1.3.6.1.2.1.2.1.0"
-	MIBifIndex  = "1.3.6.1.2.1.2.2.1.1"
-	MIBifDescr  = "1.3.6.1.2.1.2.2.1.2"
+	MIBifNumber     = "1.3.6.1.2.1.2.1.0"
+	MIBifIndex      = "1.3.6.1.2.1.2.2.1.1"
+	MIBifDescr      = "1.3.6.1.2.1.2.2.1.2"
+	MIBifOperStatus = "1.3.6.1.2.1.2.2.1.8"
 )
 
 var mibOidmapping = map[string]string{
@@ -137,6 +138,7 @@ type CollectParams struct {
 	includeRegexp, excludeRegexp       *regexp.Regexp
 	includeInterface, excludeInterface *string
 	verbose                            *bool
+	skipDownLinkState                  *bool
 }
 
 var buffers = list.New()
@@ -151,6 +153,7 @@ func parseFlags() (*CollectParams, error) {
 	excludeInterface := flag.String("exclude-interface", "", "exclude interface name")
 	rawMibs := flag.String("mibs", "all", "mib name joind with ',' or 'all'")
 	verbose := flag.Bool("verbose", false, "verbose")
+	skipDownLinkState := flag.Bool("skip-down-link-state", false, "skip down link state")
 	flag.Parse()
 
 	if *includeInterface != "" && *excludeInterface != "" {
@@ -176,15 +179,16 @@ func parseFlags() (*CollectParams, error) {
 	}
 
 	return &CollectParams{
-		target:           target,
-		community:        community,
-		mibs:             mibs,
-		snapshotPath:     ssPath,
-		includeRegexp:    includeReg,
-		excludeRegexp:    excludeReg,
-		includeInterface: includeInterface,
-		excludeInterface: excludeInterface,
-		verbose:          verbose,
+		target:            target,
+		community:         community,
+		mibs:              mibs,
+		snapshotPath:      ssPath,
+		includeRegexp:     includeReg,
+		excludeRegexp:     excludeReg,
+		includeInterface:  includeInterface,
+		excludeInterface:  excludeInterface,
+		verbose:           verbose,
+		skipDownLinkState: skipDownLinkState,
 	}, nil
 }
 
@@ -315,6 +319,15 @@ func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	var ifOperStatus map[uint64]bool
+	if *c.skipDownLinkState {
+		ifOperStatus, err = bulkWalkGetInterfaceState(ifNumber)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	ifIndex, err := bulkWalkGetInterfaceNumber(ifNumber)
 	if err != nil {
 		return nil, err
@@ -347,6 +360,11 @@ func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
 		}
 
 		if *c.excludeInterface != "" && c.excludeRegexp.MatchString(ifName) {
+			continue
+		}
+
+		// skip when down(2)
+		if *c.skipDownLinkState && ifOperStatus[ifNum] == false {
 			continue
 		}
 
@@ -620,6 +638,32 @@ func bulkWalkGetInterfaceName(length uint64) (map[uint64]string, error) {
 			kv[index] = string(pdu.Value.([]byte))
 		default:
 			return errors.New("cant parse interface name.")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return kv, nil
+}
+
+func bulkWalkGetInterfaceState(length uint64) (map[uint64]bool, error) {
+	kv := make(map[uint64]bool, length)
+	err := gosnmp.Default.BulkWalk(MIBifOperStatus, func(pdu gosnmp.SnmpPDU) error {
+		index, err := captureIfIndex(MIBifOperStatus, pdu.Name)
+		if err != nil {
+			return err
+		}
+		switch pdu.Type {
+		case gosnmp.OctetString:
+			return errors.New("cant parse value.")
+		default:
+			tmp := gosnmp.ToBigInt(pdu.Value).Uint64()
+			if tmp != 2 {
+				kv[index] = true
+			} else {
+				kv[index] = false
+			}
 		}
 		return nil
 	})
