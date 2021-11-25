@@ -397,7 +397,7 @@ func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
 }
 
 func escapeInterfaceName(ifName string) string {
-	return strings.Replace(strings.Replace(ifName, "/", "-", -1), ".", "_", -1)
+	return strings.Replace(strings.Replace(strings.Replace(ifName, "/", "-", -1), ".", "_", -1), " ", "", -1)
 }
 
 func initialForMackerel(target string, verbose bool) (*string, error) {
