@@ -61,15 +61,15 @@ type ResultWithName struct {
 
 type SnapshotDutum struct {
 	ifIndex uint64
-	key     string
+	mib     string
 	value   uint64
 }
 
 type MetricsDutum struct {
-	name   string
-	ifName string
-	value  uint64
-	delta  bool
+	ifIndex uint64
+	mib     string
+	ifName  string
+	value   uint64
 }
 
 type CollectParams struct {
@@ -151,6 +151,11 @@ func main() {
 
 	log.Info("start")
 
+	gosnmp.Default.Target = collectParams.target
+	gosnmp.Default.Community = collectParams.community
+	gosnmp.Default.Timeout = time.Duration(10 * time.Second)
+	gosnmp.Default.Context = ctx
+
 	if apikey == "" {
 	} else {
 		runMackerel(ctx, collectParams)
@@ -158,10 +163,6 @@ func main() {
 }
 
 func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
-	gosnmp.Default.Target = c.target
-	gosnmp.Default.Community = c.community
-	gosnmp.Default.Timeout = time.Duration(10 * time.Second)
-	gosnmp.Default.Context = ctx
 	err := gosnmp.Default.Connect()
 	if err != nil {
 		return nil, err
@@ -185,73 +186,38 @@ func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
 		}
 	}
 
-	ifIndex, err := bulkWalkGetInterfaceNumber(ifNumber)
-	if err != nil {
-		return nil, err
-	}
+	metrics := make([]MetricsDutum, 0)
 
-	results := make([]ResultWithName, 0, len(c.mibs))
 	for _, mib := range c.mibs {
-		result, err := bulkWalk(mibOidmapping[mib], ifNumber)
+		values, err := bulkWalk(mibOidmapping[mib], ifNumber)
 		if err != nil {
 			return nil, err
 		}
-		results = append(results, ResultWithName{name: mib, value: result})
-	}
 
-	var snapshotData []SnapshotDutum
-	if _, err := os.Stat(c.snapshotPath); err == nil {
-		snapshotData, err = loadSnapshot(c.snapshotPath)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	savedSnapshot := make([]SnapshotDutum, 0)
-
-	metrics := make([]MetricsDutum, 0, len(results))
-	for _, ifNum := range ifIndex {
-		ifName := ifDescr[ifNum]
-		if *c.includeInterface != "" && !c.includeRegexp.MatchString(ifName) {
-			continue
-		}
-
-		if *c.excludeInterface != "" && c.excludeRegexp.MatchString(ifName) {
-			continue
-		}
-
-		// skip when down(2)
-		if *c.skipDownLinkState && ifOperStatus[ifNum] == false {
-			continue
-		}
-
-		for _, rwn := range results {
-			key := rwn.name
-			value := rwn.value[ifNum]
-
-			savedSnapshot = append(savedSnapshot, SnapshotDutum{ifIndex: ifNum, key: key, value: value})
-
-			prevValue := value
-			for _, k := range snapshotData {
-				if k.ifIndex == ifNum && k.key == key {
-					prevValue = k.value
-					break
-				}
+		for ifNum, value := range values {
+			ifName := ifDescr[ifNum]
+			if *c.includeInterface != "" && !c.includeRegexp.MatchString(ifName) {
+				continue
 			}
-			value = calcurateDiff(prevValue, value, overflowValue[key])
-			metrics = append(metrics, MetricsDutum{name: key, ifName: ifName, value: value, delta: deltaValues[key]})
 
-			log.WithFields(logrus.Fields{
-				"rawIfName": ifName,
-				"ifName":    escapeInterfaceName(ifName),
-				"mib":       key,
-				"value":     value,
-			}).Debug()
+			if *c.excludeInterface != "" && c.excludeRegexp.MatchString(ifName) {
+				continue
+			}
+
+			// skip when down(2)
+			if *c.skipDownLinkState && ifOperStatus[ifNum] == false {
+				continue
+			}
+
+			metrics = append(metrics,
+				MetricsDutum{
+					ifIndex: ifNum,
+					mib:     mib,
+					ifName:  ifName,
+					value:   value,
+				},
+			)
 		}
-	}
-	err = saveSnapshot(c.snapshotPath, savedSnapshot)
-	if err != nil {
-		return nil, err
 	}
 	return metrics, nil
 }

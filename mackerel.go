@@ -13,6 +13,7 @@ import (
 	"time"
 
 	mackerel "github.com/mackerelio/mackerel-client-go"
+	"github.com/sirupsen/logrus"
 )
 
 var buffers = list.New()
@@ -141,10 +142,11 @@ func transform(hostId *string, metrics []MetricsDutum) []*mackerel.HostMetricVal
 	now := time.Now().Unix()
 
 	mkMetrics := make([]*mackerel.HostMetricValue, 0, len(metrics))
+	// delta
 	for _, metric := range metrics {
-		if metric.delta {
+		if deltaValues[metric.mib] {
 			direction := "txBytes"
-			if receiveDirection[metric.name] {
+			if receiveDirection[metric.mib] {
 				direction = "rxBytes"
 			}
 			mkName := fmt.Sprintf("interface.%s.%s.delta", escapeInterfaceName(metric.ifName), direction)
@@ -157,7 +159,7 @@ func transform(hostId *string, metrics []MetricsDutum) []*mackerel.HostMetricVal
 				},
 			})
 		} else {
-			mkName := fmt.Sprintf("custom.interface.%s.%s", metric.name, escapeInterfaceName(metric.ifName))
+			mkName := fmt.Sprintf("custom.interface.%s.%s", metric.mib, escapeInterfaceName(metric.ifName))
 			mkMetrics = append(mkMetrics, &mackerel.HostMetricValue{
 				HostID: *hostId,
 				MetricValue: &mackerel.MetricValue{
@@ -198,7 +200,7 @@ func saveSnapshot(ssPath string, snapshot []SnapshotDutum) error {
 	records := make([][]string, 0)
 
 	for _, v := range snapshot {
-		records = append(records, []string{strconv.FormatUint(v.ifIndex, 10), v.key, strconv.FormatUint(v.value, 10)})
+		records = append(records, []string{strconv.FormatUint(v.ifIndex, 10), v.mib, strconv.FormatUint(v.value, 10)})
 	}
 
 	err = writer.WriteAll(records)
@@ -222,22 +224,22 @@ func loadSnapshot(ssPath string) ([]SnapshotDutum, error) {
 	data := make([]SnapshotDutum, 0)
 	reader := csv.NewReader(file)
 	for {
-		line, err := reader.Read()
+		col, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return nil, err
 		}
-		ifIndex, err := strconv.ParseUint(line[0], 10, 64)
+		ifIndex, err := strconv.ParseUint(col[0], 10, 64)
 		if err != nil {
 			return nil, err
 		}
-		value, err := strconv.ParseUint(line[2], 10, 64)
+		value, err := strconv.ParseUint(col[2], 10, 64)
 		if err != nil {
 			return nil, err
 		}
-		data = append(data, SnapshotDutum{ifIndex: ifIndex, key: line[1], value: value})
+		data = append(data, SnapshotDutum{ifIndex: ifIndex, mib: col[1], value: value})
 	}
 	return data, nil
 }
@@ -253,21 +255,77 @@ func ticker(ctx context.Context, wg *sync.WaitGroup, hostId *string, collectPara
 	for {
 		select {
 		case <-t.C:
-			metrics, err := collect(ctx, collectParams)
+			err := innerTicker(ctx, hostId, collectParams)
 			if err != nil {
 				log.Warn(err)
 			}
-
-			mkMetrics := transform(hostId, metrics)
-			mutex.Lock()
-			buffers.PushBack(mkMetrics)
-			mutex.Unlock()
-
 		case <-ctx.Done():
 			log.Warn("cancellation from context:", ctx.Err())
 			return
 		}
 	}
+}
+
+func innerTicker(ctx context.Context, hostId *string, collectParams *CollectParams) error {
+	var snapshotData []SnapshotDutum
+	if _, err := os.Stat(collectParams.snapshotPath); err == nil {
+		snapshotData, err = loadSnapshot(collectParams.snapshotPath)
+		if err != nil {
+			return err
+		}
+	}
+	savedSnapshot := make([]SnapshotDutum, 0)
+
+	metrics := make([]MetricsDutum, 0)
+
+	rawMetrics, err := collect(ctx, collectParams)
+	if err != nil {
+		return err
+	}
+	for _, metric := range rawMetrics {
+		savedSnapshot = append(savedSnapshot,
+			SnapshotDutum{
+				ifIndex: metric.ifIndex,
+				mib:     metric.mib,
+				value:   metric.value,
+			},
+		)
+
+		prevValue := metric.value
+		for _, k := range snapshotData {
+			if k.ifIndex == metric.ifIndex && k.mib == metric.mib {
+				prevValue = k.value
+				break
+			}
+		}
+
+		value := calcurateDiff(prevValue, metric.value, overflowValue[metric.mib])
+		metrics = append(metrics, MetricsDutum{
+			ifIndex: metric.ifIndex,
+			mib:     metric.mib,
+			value:   value,
+			ifName:  metric.ifName,
+		})
+
+		log.WithFields(logrus.Fields{
+			"rawIfName": metric.ifName,
+			"ifName":    escapeInterfaceName(metric.ifName),
+			"mib":       metric.mib,
+			"value":     value,
+		}).Debug()
+	}
+
+	err = saveSnapshot(collectParams.snapshotPath, savedSnapshot)
+	if err != nil {
+		return err
+	}
+
+	mkMetrics := transform(hostId, metrics)
+	mutex.Lock()
+	buffers.PushBack(mkMetrics)
+	mutex.Unlock()
+
+	return nil
 }
 
 func sendTicker(ctx context.Context, wg *sync.WaitGroup) {
