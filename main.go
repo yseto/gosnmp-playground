@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"os"
 	"os/signal"
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	"github.com/gosnmp/gosnmp"
+	"github.com/sirupsen/logrus"
 	mackerel "github.com/mackerelio/mackerel-client-go"
 )
 
@@ -137,13 +137,13 @@ type CollectParams struct {
 	mibs                               []string
 	includeRegexp, excludeRegexp       *regexp.Regexp
 	includeInterface, excludeInterface *string
-	verbose                            *bool
 	skipDownLinkState                  *bool
 }
 
 var buffers = list.New()
 var mutex = &sync.Mutex{}
 var apikey = os.Getenv("MACKEREL_API_KEY")
+var log = logrus.New()
 
 func parseFlags() (*CollectParams, error) {
 	var community, target string
@@ -152,9 +152,15 @@ func parseFlags() (*CollectParams, error) {
 	includeInterface := flag.String("include-interface", "", "include interface name")
 	excludeInterface := flag.String("exclude-interface", "", "exclude interface name")
 	rawMibs := flag.String("mibs", "all", "mib name joind with ',' or 'all'")
-	verbose := flag.Bool("verbose", false, "verbose")
+	level := flag.Bool("verbose", false, "verbose")
 	skipDownLinkState := flag.Bool("skip-down-link-state", false, "skip down link state")
 	flag.Parse()
+
+	logLevel := logrus.WarnLevel
+	if *level {
+		logLevel = logrus.DebugLevel
+	}
+	log.SetLevel(logLevel)
 
 	if *includeInterface != "" && *excludeInterface != "" {
 		return nil, errors.New("excludeInterface, includeInterface is exclusive control.")
@@ -187,7 +193,6 @@ func parseFlags() (*CollectParams, error) {
 		excludeRegexp:     excludeReg,
 		includeInterface:  includeInterface,
 		excludeInterface:  excludeInterface,
-		verbose:           verbose,
 		skipDownLinkState: skipDownLinkState,
 	}, nil
 }
@@ -196,22 +201,27 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
+	log.SetFormatter(&logrus.TextFormatter{
+		DisableColors: true,
+		FullTimestamp: true,
+	})
+
 	collectParams, err := parseFlags()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Println("start")
+	log.Info("start")
 
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go ticker(ctx, &wg, collectParams)
 
 	if apikey == "" {
-		log.Println("skip mackerel")
+		log.Info("skip mackerel")
 	} else {
 		wg.Add(1)
-		go sendTicker(ctx, &wg, *collectParams.verbose)
+		go sendTicker(ctx, &wg)
 	}
 	wg.Wait()
 }
@@ -219,7 +229,7 @@ func main() {
 func ticker(ctx context.Context, wg *sync.WaitGroup, c *CollectParams) {
 	t := time.NewTicker(1 * time.Minute)
 	defer func() {
-		fmt.Println("stopping...")
+		log.Info("stopping...")
 		t.Stop()
 		wg.Done()
 	}()
@@ -227,7 +237,7 @@ func ticker(ctx context.Context, wg *sync.WaitGroup, c *CollectParams) {
 	var hostId *string
 	if apikey != "" {
 		var err error
-		hostId, err = initialForMackerel(c.target, *c.verbose)
+		hostId, err = initialForMackerel(c.target)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -238,7 +248,7 @@ func ticker(ctx context.Context, wg *sync.WaitGroup, c *CollectParams) {
 		case <-t.C:
 			metrics, err := collect(ctx, c)
 			if err != nil {
-				log.Println(err)
+				log.Warn(err)
 			}
 
 			if apikey != "" {
@@ -249,18 +259,18 @@ func ticker(ctx context.Context, wg *sync.WaitGroup, c *CollectParams) {
 			}
 
 		case <-ctx.Done():
-			log.Println("cancellation from context:", ctx.Err())
+			log.Warn("cancellation from context:", ctx.Err())
 			return
 		}
 	}
 }
 
-func sendTicker(ctx context.Context, wg *sync.WaitGroup, verbose bool) {
+func sendTicker(ctx context.Context, wg *sync.WaitGroup) {
 	t := time.NewTicker(500 * time.Millisecond)
 	client := mackerel.NewClient(apikey)
 
 	defer func() {
-		log.Println("stopping...")
+		log.Info("stopping...")
 		t.Stop()
 		wg.Done()
 	}()
@@ -268,32 +278,30 @@ func sendTicker(ctx context.Context, wg *sync.WaitGroup, verbose bool) {
 	for {
 		select {
 		case <-t.C:
-			send(ctx, client, verbose)
+			send(ctx, client)
 
 		case <-ctx.Done():
-			log.Println("cancellation from context:", ctx.Err())
+			log.Warn("cancellation from context:", ctx.Err())
 			return
 		}
 	}
 }
 
-func send(ctx context.Context, client *mackerel.Client, verbose bool) {
+func send(ctx context.Context, client *mackerel.Client) {
 	if buffers.Len() == 0 {
 		return
 	}
 
 	e := buffers.Front()
-	// log.Printf("send current value: %#v\n", e.Value)
-	// log.Printf("buffers len: %d\n", buffers.Len())
+	// log.Info("send current value: %#v\n", e.Value)
+	// log.Info("buffers len: %d\n", buffers.Len())
 
 	err := client.PostHostMetricValues(e.Value.([]*mackerel.HostMetricValue))
 	if err != nil {
-		log.Println(err)
+		log.Warn(err)
 		return
 	} else {
-		if verbose {
-			log.Println("send mackerel")
-		}
+		log.Info("send mackerel")
 	}
 	mutex.Lock()
 	buffers.Remove(e)
@@ -384,9 +392,7 @@ func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
 			value = calcurateDiff(prevValue, value, overflowValue[key])
 			metrics = append(metrics, MetricsDutum{name: key, ifName: ifName, value: value, delta: deltaValues[key]})
 
-			if *c.verbose {
-				log.Printf("%s\t%s\t%d\n", escapeInterfaceName(ifName), key, value)
-			}
+			log.Debugf("%s\t%s\t%d\n", escapeInterfaceName(ifName), key, value)
 		}
 	}
 	err = saveSnapshot(c.snapshotPath, savedSnapshot)
@@ -400,12 +406,10 @@ func escapeInterfaceName(ifName string) string {
 	return strings.Replace(strings.Replace(strings.Replace(ifName, "/", "-", -1), ".", "_", -1), " ", "", -1)
 }
 
-func initialForMackerel(target string, verbose bool) (*string, error) {
+func initialForMackerel(target string) (*string, error) {
 	client := mackerel.NewClient(apikey)
 
-	if verbose {
-		log.Println("init for mackerel")
-	}
+	log.Info("init for mackerel")
 
 	idPath, err := hostIdPath(target)
 	if err != nil {
