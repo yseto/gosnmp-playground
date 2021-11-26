@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +19,6 @@ import (
 
 const (
 	MIBifNumber     = "1.3.6.1.2.1.2.1.0"
-	MIBifIndex      = "1.3.6.1.2.1.2.2.1.1"
 	MIBifDescr      = "1.3.6.1.2.1.2.2.1.2"
 	MIBifOperStatus = "1.3.6.1.2.1.2.2.1.8"
 )
@@ -52,11 +50,6 @@ var deltaValues = map[string]bool{
 	"ifOutOctets":   true,
 	"ifHCInOctets":  true,
 	"ifHCOutOctets": true,
-}
-
-type ResultWithName struct {
-	name  string
-	value map[uint64]uint64
 }
 
 type SnapshotDutum struct {
@@ -205,7 +198,7 @@ func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
 			}
 
 			// skip when down(2)
-			if *c.skipDownLinkState && ifOperStatus[ifNum] == false {
+			if *c.skipDownLinkState && !ifOperStatus[ifNum] {
 				continue
 			}
 
@@ -274,26 +267,6 @@ func getInterfaceNumber() (uint64, error) {
 	default:
 		return gosnmp.ToBigInt(variable.Value).Uint64(), nil
 	}
-}
-
-func bulkWalkGetInterfaceNumber(length uint64) ([]uint64, error) {
-	kv := make([]uint64, 0, length)
-	err := gosnmp.Default.BulkWalk(MIBifIndex, func(pdu gosnmp.SnmpPDU) error {
-		switch pdu.Type {
-		case gosnmp.OctetString:
-			return errors.New("cant parse interface number.")
-		default:
-			kv = append(kv, gosnmp.ToBigInt(pdu.Value).Uint64())
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	sort.Slice(kv, func(i, j int) bool {
-		return kv[i] < kv[j]
-	})
-	return kv, nil
 }
 
 func bulkWalkGetInterfaceName(length uint64) (map[uint64]string, error) {
