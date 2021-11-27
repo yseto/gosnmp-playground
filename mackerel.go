@@ -193,7 +193,6 @@ func loadSnapshot(ssPath string) ([]MetricsDutum, error) {
 func ticker(ctx context.Context, wg *sync.WaitGroup, hostId *string, collectParams *CollectParams) {
 	t := time.NewTicker(1 * time.Minute)
 	defer func() {
-		log.Info("stopping...")
 		t.Stop()
 		wg.Done()
 	}()
@@ -290,7 +289,6 @@ func sendTicker(ctx context.Context, wg *sync.WaitGroup, client *mackerel.Client
 	t := time.NewTicker(500 * time.Millisecond)
 
 	defer func() {
-		log.Info("stopping...")
 		t.Stop()
 		wg.Done()
 	}()
