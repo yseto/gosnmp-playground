@@ -52,17 +52,11 @@ var deltaValues = map[string]bool{
 	"ifHCOutOctets": true,
 }
 
-type SnapshotDutum struct {
-	ifIndex uint64
-	mib     string
-	value   uint64
-}
-
 type MetricsDutum struct {
-	ifIndex uint64
-	mib     string
-	ifName  string
-	value   uint64
+	IfIndex uint64 `json:ifIndex`
+	Mib     string `json:mib`
+	IfName  string `json:ifName`
+	Value   uint64 `json:value`
 }
 
 type CollectParams struct {
@@ -198,10 +192,10 @@ func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
 
 			metrics = append(metrics,
 				MetricsDutum{
-					ifIndex: ifNum,
-					mib:     mib,
-					ifName:  ifName,
-					value:   value,
+					IfIndex: ifNum,
+					Mib:     mib,
+					IfName:  ifName,
+					Value:   value,
 				},
 			)
 		}

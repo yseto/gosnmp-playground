@@ -3,12 +3,10 @@ package main
 import (
 	"container/list"
 	"context"
-	"encoding/csv"
+	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"time"
 
@@ -86,7 +84,7 @@ func runMackerel(ctx context.Context, collectParams *CollectParams) {
 	go ticker(ctx, &wg, hostId, collectParams)
 
 	wg.Add(1)
-	go sendTicker(ctx, &wg, client)
+	go sendTicker(ctx, &wg, client, hostId)
 	wg.Wait()
 }
 
@@ -137,37 +135,30 @@ func initialForMackerel(c *CollectParams, client *mackerel.Client) (*string, err
 	return &hostId, nil
 }
 
-func transform(hostId *string, metrics []MetricsDutum) []*mackerel.HostMetricValue {
+func transform(metrics []MetricsDutum) []*mackerel.MetricValue {
 	now := time.Now().Unix()
 
-	mkMetrics := make([]*mackerel.HostMetricValue, 0, len(metrics))
+	mkMetrics := make([]*mackerel.MetricValue, 0, len(metrics))
 	// delta
 	for _, metric := range metrics {
-		if deltaValues[metric.mib] {
+		var name string
+		ifName := escapeInterfaceName(metric.IfName)
+		if deltaValues[metric.Mib] {
 			direction := "txBytes"
-			if receiveDirection[metric.mib] {
+			if receiveDirection[metric.Mib] {
 				direction = "rxBytes"
 			}
-			mkName := fmt.Sprintf("interface.%s.%s.delta", escapeInterfaceName(metric.ifName), direction)
-			mkMetrics = append(mkMetrics, &mackerel.HostMetricValue{
-				HostID: *hostId,
-				MetricValue: &mackerel.MetricValue{
-					Name:  mkName,
-					Time:  now,
-					Value: (metric.value / 60),
-				},
-			})
+			name := fmt.Sprintf("interface.%s.%s.delta", ifName, direction)
+			metric.Value /= 60
 		} else {
-			mkName := fmt.Sprintf("custom.interface.%s.%s", metric.mib, escapeInterfaceName(metric.ifName))
-			mkMetrics = append(mkMetrics, &mackerel.HostMetricValue{
-				HostID: *hostId,
-				MetricValue: &mackerel.MetricValue{
-					Name:  mkName,
-					Time:  now,
-					Value: metric.value,
-				},
-			})
+			name := fmt.Sprintf("custom.interface.%s.%s", metric.Mib, ifName)
 		}
+		mkMetrics = append(mkMetrics, &mackerel.MetricValue{
+			Name:  name,
+			Time:  now,
+			Value: metric.Value,
+		})
+
 	}
 	return mkMetrics
 }
@@ -185,62 +176,24 @@ func (c *CollectParams) snapshotPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(wd, fmt.Sprintf("%s.txt", c.target)), nil
+	return filepath.Join(wd, fmt.Sprintf("%s.json", c.target)), nil
 }
 
-func saveSnapshot(ssPath string, snapshot []SnapshotDutum) error {
-	file, err := os.Create(ssPath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	writer := csv.NewWriter(file)
-	records := make([][]string, 0)
-
-	for _, v := range snapshot {
-		records = append(records, []string{strconv.FormatUint(v.ifIndex, 10), v.mib, strconv.FormatUint(v.value, 10)})
-	}
-
-	err = writer.WriteAll(records)
-	if err != nil {
-		return err
-	}
-
-	if err := writer.Error(); err != nil {
-		return err
-	}
-	return nil
+func saveSnapshot(ssPath string, snapshot []MetricsDutum) error {
+	file, _ := json.Marshal(snapshot)
+	return os.WriteFile(ssPath, file, 0644)
 }
 
-func loadSnapshot(ssPath string) ([]SnapshotDutum, error) {
-	file, err := os.Open(ssPath)
-	if err != nil {
-		return nil, err
+func loadSnapshot(ssPath string) ([]MetricsDutum, error) {
+	var snapshot []MetricsDutum
+	if _, err := os.Stat(ssPath); err == nil {
+		file, err := os.ReadFile(ssPath)
+		if err != nil {
+			return nil, err
+		}
+		json.Unmarshal(file, &snapshot)
 	}
-	defer file.Close()
-
-	data := make([]SnapshotDutum, 0)
-	reader := csv.NewReader(file)
-	for {
-		col, err := reader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		ifIndex, err := strconv.ParseUint(col[0], 10, 64)
-		if err != nil {
-			return nil, err
-		}
-		value, err := strconv.ParseUint(col[2], 10, 64)
-		if err != nil {
-			return nil, err
-		}
-		data = append(data, SnapshotDutum{ifIndex: ifIndex, mib: col[1], value: value})
-	}
-	return data, nil
+	return snapshot, nil
 }
 
 func ticker(ctx context.Context, wg *sync.WaitGroup, hostId *string, collectParams *CollectParams) {
@@ -271,67 +224,55 @@ func innerTicker(ctx context.Context, hostId *string, collectParams *CollectPara
 		return err
 	}
 
-	var snapshotData []SnapshotDutum
-	if _, err := os.Stat(ssPath); err == nil {
-		snapshotData, err = loadSnapshot(ssPath)
-		if err != nil {
-			return err
-		}
+	prevSnapshot, err := loadSnapshot(ssPath)
+	if err != nil {
+		return err
 	}
-	savedSnapshot := make([]SnapshotDutum, 0)
-
-	metrics := make([]MetricsDutum, 0)
 
 	rawMetrics, err := collect(ctx, collectParams)
 	if err != nil {
 		return err
 	}
-	for _, metric := range rawMetrics {
-		savedSnapshot = append(savedSnapshot,
-			SnapshotDutum{
-				ifIndex: metric.ifIndex,
-				mib:     metric.mib,
-				value:   metric.value,
-			},
-		)
 
-		prevValue := metric.value
-		for _, k := range snapshotData {
-			if k.ifIndex == metric.ifIndex && k.mib == metric.mib {
-				prevValue = k.value
-				break
-			}
-		}
-
-		value := calcurateDiff(prevValue, metric.value, overflowValue[metric.mib])
-		metrics = append(metrics, MetricsDutum{
-			ifIndex: metric.ifIndex,
-			mib:     metric.mib,
-			value:   value,
-			ifName:  metric.ifName,
-		})
-
-		log.WithFields(logrus.Fields{
-			"rawIfName": metric.ifName,
-			"ifName":    escapeInterfaceName(metric.ifName),
-			"mib":       metric.mib,
-			"value":     value,
-		}).Debug()
-	}
-
-	err = saveSnapshot(ssPath, savedSnapshot)
+	err = saveSnapshot(ssPath, rawMetrics)
 	if err != nil {
 		return err
 	}
 
+	metrics := make([]MetricsDutum, 0)
+	for _, metric := range rawMetrics {
+		prevValue := metric.Value
+		for _, v := range prevSnapshot {
+			if v.IfIndex == metric.IfIndex && v.Mib == metric.Mib {
+				prevValue = v.Value
+				break
+			}
+		}
+
+		value := calcurateDiff(prevValue, metric.Value, overflowValue[metric.Mib])
+		metrics = append(metrics, MetricsDutum{
+			IfIndex: metric.IfIndex,
+			Mib:     metric.Mib,
+			Value:   value,
+			IfName:  metric.IfName,
+		})
+
+		log.WithFields(logrus.Fields{
+			"rawIfName": metric.IfName,
+			"ifName":    escapeInterfaceName(metric.IfName),
+			"mib":       metric.Mib,
+			"value":     value,
+		}).Debug()
+	}
+
 	mutex.Lock()
-	buffers.PushBack(transform(hostId, metrics))
+	buffers.PushBack(transform(metrics))
 	mutex.Unlock()
 
 	return nil
 }
 
-func sendTicker(ctx context.Context, wg *sync.WaitGroup, client *mackerel.Client) {
+func sendTicker(ctx context.Context, wg *sync.WaitGroup, client *mackerel.Client, hostId *string) {
 	t := time.NewTicker(500 * time.Millisecond)
 
 	defer func() {
@@ -343,7 +284,7 @@ func sendTicker(ctx context.Context, wg *sync.WaitGroup, client *mackerel.Client
 	for {
 		select {
 		case <-t.C:
-			sendToMackerel(ctx, client)
+			sendToMackerel(ctx, client, hostId)
 
 		case <-ctx.Done():
 			log.Warn("cancellation from context:", ctx.Err())
@@ -352,7 +293,7 @@ func sendTicker(ctx context.Context, wg *sync.WaitGroup, client *mackerel.Client
 	}
 }
 
-func sendToMackerel(ctx context.Context, client *mackerel.Client) {
+func sendToMackerel(ctx context.Context, client *mackerel.Client, hostId *string) {
 	if buffers.Len() == 0 {
 		return
 	}
@@ -361,7 +302,7 @@ func sendToMackerel(ctx context.Context, client *mackerel.Client) {
 	// log.Infof("send current value: %#v", e.Value)
 	// log.Infof("buffers len: %d", buffers.Len())
 
-	err := client.PostHostMetricValues(e.Value.([]*mackerel.HostMetricValue))
+	err := client.PostHostMetricValuesByHostID(*hostId, e.Value.([](*mackerel.MetricValue)))
 	if err != nil {
 		log.Warn(err)
 		return
