@@ -66,7 +66,7 @@ type MetricsDutum struct {
 }
 
 type CollectParams struct {
-	community, target, snapshotPath    string
+	community, target                  string
 	mibs                               []string
 	includeRegexp, excludeRegexp       *regexp.Regexp
 	includeInterface, excludeInterface *string
@@ -110,16 +110,10 @@ func parseFlags() (*CollectParams, error) {
 		return nil, err
 	}
 
-	ssPath, err := snapshotPath(target)
-	if err != nil {
-		return nil, err
-	}
-
 	return &CollectParams{
 		target:            target,
 		community:         community,
 		mibs:              mibs,
-		snapshotPath:      ssPath,
 		includeRegexp:     includeReg,
 		excludeRegexp:     excludeReg,
 		includeInterface:  includeInterface,

@@ -75,7 +75,7 @@ var receiveDirection = map[string]bool{
 
 func runMackerel(ctx context.Context, collectParams *CollectParams) {
 	client := mackerel.NewClient(apikey)
-	hostId, err := initialForMackerel(collectParams.target, client)
+	hostId, err := initialForMackerel(collectParams, client)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -86,22 +86,21 @@ func runMackerel(ctx context.Context, collectParams *CollectParams) {
 	go ticker(ctx, &wg, hostId, collectParams)
 
 	wg.Add(1)
-	go sendTicker(ctx, &wg)
+	go sendTicker(ctx, &wg, client)
 	wg.Wait()
 }
 
-func initialForMackerel(target string, client *mackerel.Client) (*string, error) {
-
+func initialForMackerel(c *CollectParams, client *mackerel.Client) (*string, error) {
 	log.Info("init for mackerel")
 
-	idPath, err := hostIdPath(target)
+	idPath, err := c.hostIdPath()
 	if err != nil {
 		return nil, err
 	}
-	mkInterfaces := []mackerel.Interface{
+	interfaces := []mackerel.Interface{
 		mackerel.Interface{
 			Name:          "main",
-			IPv4Addresses: []string{target},
+			IPv4Addresses: []string{c.target},
 		},
 	}
 	var hostId string
@@ -112,16 +111,16 @@ func initialForMackerel(target string, client *mackerel.Client) (*string, error)
 		}
 		hostId = string(bytes)
 		_, err = client.UpdateHost(hostId, &mackerel.UpdateHostParam{
-			Name:       target,
-			Interfaces: mkInterfaces,
+			Name:       c.target,
+			Interfaces: interfaces,
 		})
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		hostId, err = client.CreateHost(&mackerel.CreateHostParam{
-			Name:       target,
-			Interfaces: mkInterfaces,
+			Name:       c.target,
+			Interfaces: interfaces,
 		})
 		if err != nil {
 			return nil, err
@@ -173,20 +172,20 @@ func transform(hostId *string, metrics []MetricsDutum) []*mackerel.HostMetricVal
 	return mkMetrics
 }
 
-func hostIdPath(target string) (string, error) {
+func (c *CollectParams) hostIdPath() (string, error) {
 	wd, err := os.Getwd()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(wd, fmt.Sprintf("%s.id.txt", target)), nil
+	return filepath.Join(wd, fmt.Sprintf("%s.id.txt", c.target)), nil
 }
 
-func snapshotPath(target string) (string, error) {
+func (c *CollectParams) snapshotPath() (string, error) {
 	wd, err := os.Getwd()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(wd, fmt.Sprintf("%s.txt", target)), nil
+	return filepath.Join(wd, fmt.Sprintf("%s.txt", c.target)), nil
 }
 
 func saveSnapshot(ssPath string, snapshot []SnapshotDutum) error {
@@ -267,9 +266,14 @@ func ticker(ctx context.Context, wg *sync.WaitGroup, hostId *string, collectPara
 }
 
 func innerTicker(ctx context.Context, hostId *string, collectParams *CollectParams) error {
+	ssPath, err := collectParams.snapshotPath()
+	if err != nil {
+		return err
+	}
+
 	var snapshotData []SnapshotDutum
-	if _, err := os.Stat(collectParams.snapshotPath); err == nil {
-		snapshotData, err = loadSnapshot(collectParams.snapshotPath)
+	if _, err := os.Stat(ssPath); err == nil {
+		snapshotData, err = loadSnapshot(ssPath)
 		if err != nil {
 			return err
 		}
@@ -315,22 +319,20 @@ func innerTicker(ctx context.Context, hostId *string, collectParams *CollectPara
 		}).Debug()
 	}
 
-	err = saveSnapshot(collectParams.snapshotPath, savedSnapshot)
+	err = saveSnapshot(ssPath, savedSnapshot)
 	if err != nil {
 		return err
 	}
 
-	mkMetrics := transform(hostId, metrics)
 	mutex.Lock()
-	buffers.PushBack(mkMetrics)
+	buffers.PushBack(transform(hostId, metrics))
 	mutex.Unlock()
 
 	return nil
 }
 
-func sendTicker(ctx context.Context, wg *sync.WaitGroup) {
+func sendTicker(ctx context.Context, wg *sync.WaitGroup, client *mackerel.Client) {
 	t := time.NewTicker(500 * time.Millisecond)
-	client := mackerel.NewClient(apikey)
 
 	defer func() {
 		log.Info("stopping...")
@@ -341,7 +343,7 @@ func sendTicker(ctx context.Context, wg *sync.WaitGroup) {
 	for {
 		select {
 		case <-t.C:
-			send(ctx, client)
+			sendToMackerel(ctx, client)
 
 		case <-ctx.Done():
 			log.Warn("cancellation from context:", ctx.Err())
@@ -350,21 +352,21 @@ func sendTicker(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-func send(ctx context.Context, client *mackerel.Client) {
+func sendToMackerel(ctx context.Context, client *mackerel.Client) {
 	if buffers.Len() == 0 {
 		return
 	}
 
 	e := buffers.Front()
-	log.Infof("send current value: %#v\n", e.Value)
-	log.Infof("buffers len: %d\n", buffers.Len())
+	// log.Infof("send current value: %#v", e.Value)
+	// log.Infof("buffers len: %d", buffers.Len())
 
 	err := client.PostHostMetricValues(e.Value.([]*mackerel.HostMetricValue))
 	if err != nil {
 		log.Warn(err)
 		return
 	} else {
-		log.Info("send mackerel")
+		log.Info("success")
 	}
 	mutex.Lock()
 	buffers.Remove(e)
