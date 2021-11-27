@@ -34,10 +34,10 @@ var mibOidmapping = map[string]string{
 }
 
 type MetricsDutum struct {
-	IfIndex uint64 `json:ifIndex`
-	Mib     string `json:mib`
-	IfName  string `json:ifName`
-	Value   uint64 `json:value`
+	IfIndex uint64 `json:"ifIndex"`
+	Mib     string `json:"mib"`
+	IfName  string `json:"ifName"`
+	Value   uint64 `json:"value"`
 }
 
 type CollectParams struct {
@@ -125,6 +125,12 @@ func main() {
 	gosnmp.Default.Context = ctx
 
 	if apikey == "" {
+		log.SetLevel(logrus.DebugLevel)
+
+		_, err := collect(ctx, collectParams)
+		if err != nil {
+			log.Fatal(err)
+		}
 	} else {
 		runMackerel(ctx, collectParams)
 	}
@@ -162,8 +168,8 @@ func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
 			return nil, err
 		}
 
-		for ifNum, value := range values {
-			ifName := ifDescr[ifNum]
+		for ifIndex, value := range values {
+			ifName := ifDescr[ifIndex]
 			if *c.includeInterface != "" && !c.includeRegexp.MatchString(ifName) {
 				continue
 			}
@@ -173,18 +179,18 @@ func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
 			}
 
 			// skip when down(2)
-			if *c.skipDownLinkState && !ifOperStatus[ifNum] {
+			if *c.skipDownLinkState && !ifOperStatus[ifIndex] {
 				continue
 			}
 
-			metrics = append(metrics,
-				MetricsDutum{
-					IfIndex: ifNum,
-					Mib:     mib,
-					IfName:  ifName,
-					Value:   value,
-				},
-			)
+			log.WithFields(logrus.Fields{
+				"IfIndex": ifIndex,
+				"Mib":     mib,
+				"IfName":  ifName,
+				"Value":   value,
+			}).Debug()
+
+			metrics = append(metrics, MetricsDutum{IfIndex: ifIndex, Mib: mib, IfName: ifName, Value: value})
 		}
 	}
 	return metrics, nil

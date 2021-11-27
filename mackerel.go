@@ -13,7 +13,6 @@ import (
 	"time"
 
 	mackerel "github.com/mackerelio/mackerel-client-go"
-	"github.com/sirupsen/logrus"
 )
 
 var buffers = list.New()
@@ -183,7 +182,10 @@ func loadSnapshot(ssPath string) ([]MetricsDutum, error) {
 		if err != nil {
 			return nil, err
 		}
-		json.Unmarshal(file, &snapshot)
+		err = json.Unmarshal(file, &snapshot)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return snapshot, nil
 }
@@ -256,13 +258,6 @@ func innerTicker(ctx context.Context, hostId *string, collectParams *CollectPara
 		}
 
 		value := calcurateDiff(prevValue, metric.Value, overflowValue[metric.Mib])
-
-		log.WithFields(logrus.Fields{
-			"rawIfName": metric.IfName,
-			"ifName":    escapeInterfaceName(metric.IfName),
-			"mib":       metric.Mib,
-			"value":     value,
-		}).Debug()
 
 		var name string
 		ifName := escapeInterfaceName(metric.IfName)
