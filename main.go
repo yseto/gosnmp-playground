@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"math"
 	"os"
 	"os/signal"
 	"regexp"
@@ -34,24 +33,6 @@ var mibOidmapping = map[string]string{
 	"ifOutErrors":   "1.3.6.1.2.1.2.2.1.20",
 }
 
-var overflowValue = map[string]uint64{
-	"ifInOctets":    math.MaxUint32,
-	"ifOutOctets":   math.MaxUint32,
-	"ifHCInOctets":  math.MaxUint64,
-	"ifHCOutOctets": math.MaxUint64,
-	"ifInDiscards":  math.MaxUint64,
-	"ifOutDiscards": math.MaxUint64,
-	"ifInErrors":    math.MaxUint64,
-	"ifOutErrors":   math.MaxUint64,
-}
-
-var deltaValues = map[string]bool{
-	"ifInOctets":    true,
-	"ifOutOctets":   true,
-	"ifHCInOctets":  true,
-	"ifHCOutOctets": true,
-}
-
 type MetricsDutum struct {
 	IfIndex uint64 `json:ifIndex`
 	Mib     string `json:mib`
@@ -60,7 +41,7 @@ type MetricsDutum struct {
 }
 
 type CollectParams struct {
-	community, target                  string
+	community, target, name            string
 	mibs                               []string
 	includeRegexp, excludeRegexp       *regexp.Regexp
 	includeInterface, excludeInterface *string
@@ -71,7 +52,7 @@ var log = logrus.New()
 var apikey = os.Getenv("MACKEREL_API_KEY")
 
 func parseFlags() (*CollectParams, error) {
-	var community, target string
+	var community, target, name string
 	flag.StringVar(&community, "community", "public", "the community string for device")
 	flag.StringVar(&target, "target", "127.0.0.1", "ip address")
 	includeInterface := flag.String("include-interface", "", "include interface name")
@@ -79,6 +60,7 @@ func parseFlags() (*CollectParams, error) {
 	rawMibs := flag.String("mibs", "all", "mib name joind with ',' or 'all'")
 	level := flag.Bool("verbose", false, "verbose")
 	skipDownLinkState := flag.Bool("skip-down-link-state", false, "skip down link state")
+	flag.StringVar(&name, "name", "", "name")
 	flag.Parse()
 
 	logLevel := logrus.WarnLevel
@@ -86,6 +68,10 @@ func parseFlags() (*CollectParams, error) {
 		logLevel = logrus.DebugLevel
 	}
 	log.SetLevel(logLevel)
+
+	if name == "" {
+		name = target
+	}
 
 	if *includeInterface != "" && *excludeInterface != "" {
 		return nil, errors.New("excludeInterface, includeInterface is exclusive control.")
@@ -106,6 +92,7 @@ func parseFlags() (*CollectParams, error) {
 
 	return &CollectParams{
 		target:            target,
+		name:              name,
 		community:         community,
 		mibs:              mibs,
 		includeRegexp:     includeReg,
@@ -203,10 +190,6 @@ func collect(ctx context.Context, c *CollectParams) ([]MetricsDutum, error) {
 	return metrics, nil
 }
 
-func escapeInterfaceName(ifName string) string {
-	return strings.Replace(strings.Replace(strings.Replace(ifName, "/", "-", -1), ".", "_", -1), " ", "", -1)
-}
-
 func mibsValidate(rawMibs *string) ([]string, error) {
 	var parseMibs []string
 	switch *rawMibs {
@@ -228,14 +211,6 @@ func mibsValidate(rawMibs *string) ([]string, error) {
 		}
 	}
 	return parseMibs, nil
-}
-
-func calcurateDiff(a, b, overflow uint64) uint64 {
-	if b < a {
-		return overflow - a + b
-	} else {
-		return b - a
-	}
 }
 
 func captureIfIndex(oid, name string) (uint64, error) {

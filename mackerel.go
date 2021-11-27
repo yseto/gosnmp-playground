@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,11 +66,29 @@ var graphDefs = []*mackerel.GraphDefsParam{
 	},
 }
 
+var overflowValue = map[string]uint64{
+	"ifInOctets":    math.MaxUint32,
+	"ifOutOctets":   math.MaxUint32,
+	"ifHCInOctets":  math.MaxUint64,
+	"ifHCOutOctets": math.MaxUint64,
+	"ifInDiscards":  math.MaxUint64,
+	"ifOutDiscards": math.MaxUint64,
+	"ifInErrors":    math.MaxUint64,
+	"ifOutErrors":   math.MaxUint64,
+}
+
 var receiveDirection = map[string]bool{
 	"ifInOctets":   true,
 	"ifHCInOctets": true,
 	"ifInDiscards": true,
 	"ifInErrors":   true,
+}
+
+var deltaValues = map[string]bool{
+	"ifInOctets":    true,
+	"ifOutOctets":   true,
+	"ifHCInOctets":  true,
+	"ifHCOutOctets": true,
 }
 
 func runMackerel(ctx context.Context, collectParams *CollectParams) {
@@ -109,7 +129,7 @@ func initialForMackerel(c *CollectParams, client *mackerel.Client) (*string, err
 		}
 		hostId = string(bytes)
 		_, err = client.UpdateHost(hostId, &mackerel.UpdateHostParam{
-			Name:       c.target,
+			Name:       c.name,
 			Interfaces: interfaces,
 		})
 		if err != nil {
@@ -117,7 +137,7 @@ func initialForMackerel(c *CollectParams, client *mackerel.Client) (*string, err
 		}
 	} else {
 		hostId, err = client.CreateHost(&mackerel.CreateHostParam{
-			Name:       c.target,
+			Name:       c.name,
 			Interfaces: interfaces,
 		})
 		if err != nil {
@@ -133,34 +153,6 @@ func initialForMackerel(c *CollectParams, client *mackerel.Client) (*string, err
 		return nil, err
 	}
 	return &hostId, nil
-}
-
-func transform(metrics []MetricsDutum) []*mackerel.MetricValue {
-	now := time.Now().Unix()
-
-	mkMetrics := make([]*mackerel.MetricValue, 0, len(metrics))
-	// delta
-	for _, metric := range metrics {
-		var name string
-		ifName := escapeInterfaceName(metric.IfName)
-		if deltaValues[metric.Mib] {
-			direction := "txBytes"
-			if receiveDirection[metric.Mib] {
-				direction = "rxBytes"
-			}
-			name := fmt.Sprintf("interface.%s.%s.delta", ifName, direction)
-			metric.Value /= 60
-		} else {
-			name := fmt.Sprintf("custom.interface.%s.%s", metric.Mib, ifName)
-		}
-		mkMetrics = append(mkMetrics, &mackerel.MetricValue{
-			Name:  name,
-			Time:  now,
-			Value: metric.Value,
-		})
-
-	}
-	return mkMetrics
 }
 
 func (c *CollectParams) hostIdPath() (string, error) {
@@ -218,6 +210,18 @@ func ticker(ctx context.Context, wg *sync.WaitGroup, hostId *string, collectPara
 	}
 }
 
+func escapeInterfaceName(ifName string) string {
+	return strings.Replace(strings.Replace(strings.Replace(ifName, "/", "-", -1), ".", "_", -1), " ", "", -1)
+}
+
+func calcurateDiff(a, b, overflow uint64) uint64 {
+	if b < a {
+		return overflow - a + b
+	} else {
+		return b - a
+	}
+}
+
 func innerTicker(ctx context.Context, hostId *string, collectParams *CollectParams) error {
 	ssPath, err := collectParams.snapshotPath()
 	if err != nil {
@@ -239,7 +243,9 @@ func innerTicker(ctx context.Context, hostId *string, collectParams *CollectPara
 		return err
 	}
 
-	metrics := make([]MetricsDutum, 0)
+	now := time.Now().Unix()
+
+	metrics := make([]*mackerel.MetricValue, 0)
 	for _, metric := range rawMetrics {
 		prevValue := metric.Value
 		for _, v := range prevSnapshot {
@@ -250,12 +256,6 @@ func innerTicker(ctx context.Context, hostId *string, collectParams *CollectPara
 		}
 
 		value := calcurateDiff(prevValue, metric.Value, overflowValue[metric.Mib])
-		metrics = append(metrics, MetricsDutum{
-			IfIndex: metric.IfIndex,
-			Mib:     metric.Mib,
-			Value:   value,
-			IfName:  metric.IfName,
-		})
 
 		log.WithFields(logrus.Fields{
 			"rawIfName": metric.IfName,
@@ -263,10 +263,29 @@ func innerTicker(ctx context.Context, hostId *string, collectParams *CollectPara
 			"mib":       metric.Mib,
 			"value":     value,
 		}).Debug()
+
+		var name string
+		ifName := escapeInterfaceName(metric.IfName)
+		if deltaValues[metric.Mib] {
+			direction := "txBytes"
+			if receiveDirection[metric.Mib] {
+				direction = "rxBytes"
+			}
+			name = fmt.Sprintf("interface.%s.%s.delta", ifName, direction)
+			value /= 60
+		} else {
+			name = fmt.Sprintf("custom.interface.%s.%s", metric.Mib, ifName)
+		}
+		metrics = append(metrics, &mackerel.MetricValue{
+			Name:  name,
+			Time:  now,
+			Value: value,
+		})
+
 	}
 
 	mutex.Lock()
-	buffers.PushBack(transform(metrics))
+	buffers.PushBack(metrics)
 	mutex.Unlock()
 
 	return nil
