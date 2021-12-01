@@ -3,7 +3,6 @@ package main
 import (
 	"container/list"
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -17,6 +16,7 @@ import (
 
 var buffers = list.New()
 var mutex = &sync.Mutex{}
+var snapshot []MetricsDutum
 
 var graphDefs = []*mackerel.GraphDefsParam{
 	&mackerel.GraphDefsParam{
@@ -92,7 +92,13 @@ var deltaValues = map[string]bool{
 
 func runMackerel(ctx context.Context, collectParams *CollectParams) {
 	client := mackerel.NewClient(apikey)
+
 	hostId, err := initialForMackerel(collectParams, client)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	snapshot, err = collect(ctx, collectParams)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -162,34 +168,6 @@ func (c *CollectParams) hostIdPath() (string, error) {
 	return filepath.Join(wd, fmt.Sprintf("%s.id.txt", c.target)), nil
 }
 
-func (c *CollectParams) snapshotPath() (string, error) {
-	wd, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(wd, fmt.Sprintf("%s.json", c.target)), nil
-}
-
-func saveSnapshot(ssPath string, snapshot []MetricsDutum) error {
-	file, _ := json.Marshal(snapshot)
-	return os.WriteFile(ssPath, file, 0644)
-}
-
-func loadSnapshot(ssPath string) ([]MetricsDutum, error) {
-	var snapshot []MetricsDutum
-	if _, err := os.Stat(ssPath); err == nil {
-		file, err := os.ReadFile(ssPath)
-		if err != nil {
-			return nil, err
-		}
-		err = json.Unmarshal(file, &snapshot)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return snapshot, nil
-}
-
 func ticker(ctx context.Context, wg *sync.WaitGroup, hostId *string, collectParams *CollectParams) {
 	t := time.NewTicker(1 * time.Minute)
 	defer func() {
@@ -224,25 +202,13 @@ func calcurateDiff(a, b, overflow uint64) uint64 {
 }
 
 func innerTicker(ctx context.Context, hostId *string, collectParams *CollectParams) error {
-	ssPath, err := collectParams.snapshotPath()
-	if err != nil {
-		return err
-	}
-
-	prevSnapshot, err := loadSnapshot(ssPath)
-	if err != nil {
-		return err
-	}
-
 	rawMetrics, err := collect(ctx, collectParams)
 	if err != nil {
 		return err
 	}
 
-	err = saveSnapshot(ssPath, rawMetrics)
-	if err != nil {
-		return err
-	}
+	prevSnapshot := snapshot
+	snapshot = rawMetrics
 
 	now := time.Now().Unix()
 
